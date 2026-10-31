@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import math
+from typing import Any
+
 import numpy as np
 import pandas as pd
 import streamlit as st
-from pgmpy.inference import VariableElimination
-from pgmpy.models import DiscreteBayesianNetwork
 
 FEATURES = [
     "Food_type",
@@ -25,7 +26,7 @@ st.set_page_config(
 st.title("🥬 Food Expiry Predictor")
 st.markdown(
     "Estimate whether food has a **short**, **medium**, or **long** shelf life "
-    "with a Bayesian network trained on your food-storage data."
+    "using a lightweight Bayesian-style predictor trained from your food-storage data."
 )
 st.info(
     "Predictions are estimates from the uploaded dataset, not food-safety advice. "
@@ -71,6 +72,22 @@ def make_demo_data(rows: int = 240, seed: int = 42) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
+def discretize_numeric_column(series: pd.Series) -> tuple[pd.Series, list[float]]:
+    values = pd.to_numeric(series, errors="coerce").dropna()
+    if values.empty:
+        return pd.Series([], dtype="object"), []
+    q1 = float(values.quantile(0.33))
+    q2 = float(values.quantile(0.66))
+    thresholds = sorted({q1, q2})
+    bins = pd.cut(
+        series,
+        bins=[-float("inf"), *thresholds, float("inf")],
+        labels=["Low", "Medium", "High"],
+        include_lowest=True,
+    )
+    return bins.astype(str), thresholds
+
+
 def prepare_data(raw: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, list[float]]]:
     missing = [column for column in REQUIRED_COLUMNS if column not in raw.columns]
     if missing:
@@ -85,17 +102,14 @@ def prepare_data(raw: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, list[float]
 
     clean[TARGET] = pd.cut(
         clean["Expiry_days"],
-        bins=[-np.inf, 7, 15, np.inf],
+        bins=[-float("inf"), 7, 15, float("inf")],
         labels=["Short", "Medium", "Long"],
+        right=False,
     ).astype(str)
 
     cutpoints: dict[str, list[float]] = {}
     for column in ("Temperature", "Humidity"):
-        quantiles = clean[column].quantile([1 / 3, 2 / 3]).to_list()
-        cutpoints[column] = sorted(set(float(value) for value in quantiles))
-        edges = [-np.inf, *cutpoints[column], np.inf]
-        labels = ["Low", "Medium", "High"][: len(edges) - 1]
-        clean[column] = pd.cut(clean[column], bins=edges, labels=labels, include_lowest=True).astype(str)
+        clean[column], cutpoints[column] = discretize_numeric_column(clean[column])
 
     for column in ("Food_type", "Storage_condition", "Packaging"):
         clean[column] = clean[column].astype(str).str.strip()
@@ -105,22 +119,39 @@ def prepare_data(raw: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, list[float]
     return clean.reset_index(drop=True), cutpoints
 
 
-def build_model(training_data: pd.DataFrame) -> DiscreteBayesianNetwork:
-    model = DiscreteBayesianNetwork(
-        [
-            (feature, TARGET)
-            for feature in FEATURES
-        ]
-    )
-    model.fit(training_data[FEATURES + [TARGET]])
-    return model
+def build_model(training_data: pd.DataFrame) -> dict[str, Any]:
+    categories = list(training_data[TARGET].dropna().unique())
+    prior = training_data[TARGET].value_counts(normalize=True).to_dict()
+    condensed = {cat: float(prior.get(cat, 1 / len(categories))) for cat in categories}
+    conditional = {}
+    for feature in FEATURES:
+        conditional[feature] = {}
+        for value in sorted(training_data[feature].dropna().unique()):
+            conditional[feature][value] = {}
+            total = (training_data[feature] == value).sum()
+            for category in categories:
+                count = ((training_data[feature] == value) & (training_data[TARGET] == category)).sum()
+                conditional[feature][value][category] = (count + 1) / (total + len(categories))
+    return {"categories": categories, "prior": condensed, "conditional": conditional}
 
 
-def predict_category(model: DiscreteBayesianNetwork, values: dict[str, str]) -> tuple[str, dict[str, float]]:
-    result = VariableElimination(model).query(variables=[TARGET], evidence=values, show_progress=False)
-    states = result.state_names[TARGET]
-    probabilities = {str(state): float(probability) for state, probability in zip(states, result.values)}
-    return max(probabilities, key=probabilities.get), probabilities
+def predict_category(model: dict[str, Any], values: dict[str, str]) -> tuple[str, dict[str, float]]:
+    categories = model["categories"]
+    scores: dict[str, float] = {}
+    for category in categories:
+        score = math.log(model["prior"].get(category, 1 / len(categories)))
+        for feature in FEATURES:
+            value = str(values[feature])
+            feature_prob = model["conditional"][feature].get(value, {}).get(category, 1 / len(categories))
+            score += math.log(max(feature_prob, 1e-9))
+        scores[category] = score
+
+    max_score = max(scores.values())
+    exp_scores = {k: math.exp(v - max_score) for k, v in scores.items()}
+    total = sum(exp_scores.values())
+    probabilities = {k: exp_scores[k] / total for k in categories}
+    prediction = max(probabilities, key=probabilities.get)
+    return prediction, probabilities
 
 
 with st.sidebar:
@@ -196,7 +227,13 @@ with st.form("prediction_form"):
 
 
 def assign_level(value: float, thresholds: list[float]) -> str:
-    return ["Low", "Medium", "High"][int(np.searchsorted(thresholds, value, side="right"))]
+    if not thresholds:
+        return "Medium"
+    if value <= thresholds[0]:
+        return "Low"
+    if value <= thresholds[-1]:
+        return "Medium"
+    return "High"
 
 
 if submitted:
@@ -219,4 +256,4 @@ if submitted:
 with st.expander("CSV format and notes"):
     st.write("Provide one row per food observation. Temperature, humidity, and expiry days must be numeric.")
     st.code(", ".join(REQUIRED_COLUMNS), language="text")
-    st.write("Rows with missing or invalid required values are excluded. The Bayesian network is retrained each time the app starts or a new file is uploaded.")
+    st.write("Rows with missing or invalid required values are excluded. The Bayesian-style model is retrained each time the app starts or a new file is uploaded.")
